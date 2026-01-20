@@ -1,4 +1,8 @@
-# Falael Fast Resilient File Cache v1.0b for OpenCart - File Cache Driver Drop-in Replacement
+# Falael Fast Resilient File Cache for OpenCart - File Cache Driver Drop-in Replacement
+
+## Version
+
+**v1.0b**
 
 ## Overview
 
