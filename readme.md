@@ -34,7 +34,7 @@ The Falael Fast Resilient File Cache is designed as a drop-in replacement for Op
 
 - OpenCart 4.0.0.0 (Beta & Release): Architecturally compatible. It replaces the inefficient constructor-based file scanning found in these early releases with efficient on-demand path resolution.
 
-Tested in production: Currently active on a live production web store (400-1200 requests per minute) with ~9000 products in ~350 categories, consistently managing concurrent requests without service degradation. Further testing in production enviroments is needed. Please leave a comment if you have live site performance insights or if you encounter any problems.
+Tested in production: Currently active on a live production web store (400-1200 requests per minute) with ~9000 products in ~350 categories, consistently managing concurrent requests without service degradation. Further testing in production enviroments is needed. Please add an issue on GitHub if you have live site performance insights or if you encounter any problems.
 
 ## Features
 
@@ -46,15 +46,15 @@ Tested in production: Currently active on a live production web store (400-1200 
 
 - **Two-Tier Caching Strategy (L2/L1)**  
   Challenge: Cache invalidation typically forces all readers to wait for rebuild, causing latency spikes.  
-  Solution: Fresh timestamped files (L2) with stale backup copies (L1) enable fast `get` reads during rebuild operations.
+  Solution: Fresh timestamped files (L2) with stale backup copies (L1) enable fast `get` reads during invalidate/dropped rebuild operations.
 
 - **Delete-Over-Write Priority Locking**  
   Challenge: Concurrent writes during invalidation can corrupt cache state or resurrect stale data to L2.  
   Solution: Three-tier lock hierarchy (Delete > Write > Rebuild) ensures invalidation operations always succeed and cancel conflicting writes.
 
 - **Invalidation Token System (Stale Write Prevention)**  
-  Challenge: Writers pass optimistic delete check, then block on write lock while delete operation runs to completion, resuming with stale context effectively corrupting the L2 cache with invalid data.  
-  Solution: `mtime`-based versioning on delete lock file; writers capture token before lock acquisition, validate after acquiring lock to detect competing invalidations and giving up if positive detection.
+  Challenge: Writers pass optimistic delete check, then block on write lock, when a delete operation runs to completion, with write resuming with stale context effectively corrupting the L2 cache with invalid data.  
+  Solution: `mtime`-based versioning on delete lock file; writers capture token before lock acquisition, validate after acquiring lock to detect competing invalidations and giving up on positive detection.
 
 - **Advisory Rebuild Lock with Rate Limiting**  
   Challenge: Thundering herd on cache miss causes hundreds of simultaneous expensive rebuild operations.  
@@ -66,26 +66,22 @@ Tested in production: Currently active on a live production web store (400-1200 
 
 - **Zombie Promotion Garbage Collection**  
   Challenge: Aggressive GC deletion causes cache misses and rebuild storms under high load.  
-  Solution: Expired L2 files converted to L1 rather than deleted; preserves fallback data under load even during heavy GC by serving L1.
+  Solution: Expired L2 files converted to L1 rather than deleted; preserves and serves fallback data under load even during heavy GC by serving L1.
 
-- **Thundering Herd Mitigation**  
-  Challenge: Multiple concurrent readers on cache miss trigger simultaneous expensive rebuilds.  
-  Solution: 20ms rebuild lock hold time rate-limits NULL returns; readers that fail lock acquisition fall back to stale L1 data, allowing multiple rebuilds but preventing total stampede.
-  
 - **Transactionless Interface with ACID-like Consistency**  
   Challenge: OpenCart's cache interface provides no transaction support or lock handles for atomic cache rebuilds.  
   Solution: Optimistic locking and token validation achieve write consistency without long-held locks or API changes.
 
 - **Fault Tolerance Under Filesystem Chaos**  
   Challenge: External filesystem operations (`rm -rf cache/*`) during active cache use might cause cache data corruption.
-  Solution: Survives unsynchronized external wipes during active operations; self-heals directory structure.
+  Solution: Treat all potential exceptional workflows as regular, resulting in directory and file structure self-healing. 
 
 - **Per-Bucket Lock Granularity**  
-  Challenge: Hierarchical key/directory locking (matching OpenCart's nested key structure) is prohibitively I/O-expensive; global locks serialize all operations.
-  Solution: Locks scoped to first key segment (e.g., `product.*`, `category.*`) serialize only write/delete operations per bucket; the common-case L2 hit path remains completely lock-free, while cache-miss rebuilds use rate-limited NULL returns with L1 fallback instead of blocking, eliminating hierarchical locking overhead and complexity while preventing cross-bucket contention.
+  Challenge: Hierarchical key/directory locking (matching OpenCart's nested key structure) is prohibitively I/O-expensive; global locks serialize all operations. 
+  Solution: Locks scoped to first key segment (bucket) (e.g., `product.*`, `category.*`) serialize only write/delete operations per bucket; the most common-case L2 hit path remains completely lock-free, while cache-miss rebuilds use rate-limited NULL returns with L1 fallback instead of blocking, eliminating hierarchical locking overhead and complexity while preventing cross-bucket contention. 
   
 - **Time-Gated Atomic Garbage Collection with Configurable Windows**  
-  Challenge: Frequent GC runs cause I/O spikes; concurrent GC processes might corrupt cache state and cause a cascade of failing `unlink`-s.
+  Challenge: Frequent GC runs cause I/O spikes, especially when using probabalistic approache (1 of 100 requests have the chance to cause GC) - in high load scenarios request quantity per minute increases, effectively increasing the absolute density of GCs in a unit of time, also leading to concurrent GC runs; concurrent GC processes might corrupt cache state and cause a cascade of failing `unlink`-s. 
   Solution: `flock()`-controlled single-process GC with configurable interval and time-of-day restrictions.
 
 - **Cache Miss vs Cached Empty Array Detection Bugfix**  
@@ -101,8 +97,8 @@ Tested in production: Currently active on a live production web store (400-1200 
   Solution: Retry logic and error suppression handle Windows file-in-use conflicts and lock acquisition races.
 
 - **Threshold-Based Empty Directory Pruning**  
-  Challenge: Empty directory cleanup adds unnecessary filesystem overhead during normal operations.  
-  Solution: Optional cleanup activated only when bucket exceeds 15,000 files; avoids frequent unnecessary filesystem operations.
+  Challenge: Empty directory cleanup adds unnecessary filesystem overhead during normal operation.  
+  Solution: Cleanup activated only when bucket exceeds 15,000 files; avoids frequent unnecessary filesystem operations.
 
 - **Detailed Debug Logging and Test Condition Simulation**  
   Challenge: File cache race conditions and lock contention issues are non-deterministic and difficult to reproduce or diagnose in production environments.  
@@ -110,7 +106,7 @@ Tested in production: Currently active on a live production web store (400-1200 
   
 - **Comprehensive Concurrency Stress Testing**  
   Challenge: File cache implementations fail unpredictably under race conditions that unit tests cannot expose.  
-  Solution: 14-test suite validates thundering herd, race conditions, delete priority, and fault tolerance under 100+ worker load.
+  Solution: 14-test suite validates thundering herd, race conditions, delete priority, and fault tolerance under 100+ worker load (see below).
 
 ## Installation
 
@@ -182,7 +178,7 @@ This allows caching of empty arrays, false values, and other falsy data without 
 
 **Background:**
 
-OpenCart's default `product` bucket stores all product-related cache (category lists, bestsellers, related products) but not individual product pages. Caching product page data significantly improves site responsiveness during episoeds of high contention. Any product change invalidates the entire bucket, causing unnecessary cache misses across the store.
+OpenCart's default `product` bucket stores all product-related cache (category lists, bestsellers, related products) but not individual product pages. Caching product page data significantly improves site responsiveness during episoeds of high contention. By default any admin product change invalidates the entire 'product' bucket, causing unnecessary cache misses across the store.
 
 **Solution: Separate Bucket for Product Detail Pages**
 
@@ -243,8 +239,8 @@ $this->cache->delete('product'); // Lists may show stock status indicators
 
 **Impact:**
 
-- Product page edits: Only invalidate 1 key instead of entire `product` bucket
-- Order placement: Only invalidate affected product pages (typically 1-5 keys) instead of all product cache
+- Product page edits: Only invalidate 1 key instead of all products
+- Order placement: Only invalidate affected product pages (typically 1-5 keys) instead of all products
 
 **Files To Modify:**
 - `catalog/controller/product/product.php` (or equivalent product detail controller)
