@@ -81,7 +81,7 @@ Tested in production: Currently active on a live production web store (400-1200 
   - Solution: Locks scoped to first key segment (bucket) (e.g., `product.*`, `category.*`) serialize only write/delete operations per bucket; the most common-case L2 hit path remains completely lock-free, while cache-miss rebuilds use rate-limited NULL returns with L1 fallback instead of blocking, eliminating hierarchical locking overhead and complexity while preventing cross-bucket contention. 
   
 - **Time-Gated Atomic Garbage Collection with Configurable Windows**  
-  - Challenge: Frequent GC runs cause I/O spikes, especially when using probabalistic approache (1 of 100 requests have the chance to cause GC) - in high load scenarios request quantity per minute increases, effectively increasing the absolute density of GCs in a unit of time, also leading to concurrent GC runs; concurrent GC processes might corrupt cache state and cause a cascade of failing `unlink`-s. 
+  - Challenge: Frequent GC runs cause I/O spikes, especially when using probabilistic approach (1 of 100 requests have the chance to cause GC) - in high load scenarios request quantity per minute increases, effectively increasing the absolute density of GCs in a unit of time, also leading to concurrent GC runs; concurrent GC processes might corrupt cache state and cause a cascade of failing `unlink`-s. 
   - Solution: `flock()`-controlled single-process GC with configurable interval and time-of-day restrictions.
 
 - **Cache Miss vs Cached Empty Array Detection Bugfix**  
