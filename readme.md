@@ -2,7 +2,7 @@
 
 ## Version
 
-**v1.0b**
+**v1.1b**
 
 ## Overview
 
@@ -24,6 +24,11 @@ Under rebuild or invalidation storms, the driver prioritizes availability of the
 
 This driver strategically treats all potential exceptional workflows as regular, making for a fully fault-tolerant cache management.
 
+Versions:
+
+- The main OpenCart 4.x version is available under `oc_v4` repo dir.
+- An untested OpenCart 3.x compatible source port is available under `oc_v3` repo dir.
+
 ### Compatibility
 
 The Falael Fast Resilient File Cache is designed as a drop-in replacement for OpenCart 4.x. While optimized and tested on the latest versions, its design aims for broad compatibility across the 4.x branch.
@@ -33,6 +38,8 @@ The Falael Fast Resilient File Cache is designed as a drop-in replacement for Op
 - OpenCart 4.0.2.x: Compatible. It provides the atomic locking and data integrity protections that were absent in these versions' transition away from strict `flock` implementations.
 
 - OpenCart 4.0.0.0 (Beta & Release): Architecturally compatible. It replaces the inefficient constructor-based file scanning found in these early releases with efficient on-demand path resolution.
+
+- OpenCart 3.x (Alpha/**Untested**): Code migrated for lower versions of PHP compatible with OpenCart 3.x. Not tested, might need adjustments.
 
 Tested in production: Currently active on a live production web store (400-1200 requests per minute) with ~9000 products in ~350 categories, consistently managing concurrent requests without service degradation. Further testing in production enviroments is needed. Please add an issue on GitHub if you have live site performance insights or if you encounter any problems.
 
@@ -90,7 +97,7 @@ Tested in production: Currently active on a live production web store (400-1200 
   
 - **Non-Blocking Optimistic Gatekeeper Checks**
   - Challenge: Lock acquisition attempts block even when operation will inevitably fail.
-  - Solution: Fast pre-lock validations reduces contention; graceful degradation on lock acquisition failure.
+  - Solution: Fast pre-lock validations reduce contention; graceful degradation on lock acquisition failure.
 
 - **Cross-Platform File Locking (Windows/Linux)**  
   - Challenge: Windows file locking semantics differ from POSIX; file-in-use errors break cache operations.  
@@ -115,33 +122,33 @@ Tested in production: Currently active on a live production web store (400-1200 
 1. **Back up the existing cache driver:**
 
    ```bash
-   cp system/library/cache/file.php system/library/cache/file.php.backup
+   cp system/library/cache/file.php <oc_root>/system/library/cache/file.php.backup
    ```
 
 2. **Copy the Falael Fast Resilient File Cache over your OpenCart installation:**
 
    ```bash
-   cp -r falael-cache/system/* /path/to/your/opencart/system/
-   cp falael-cache/test_runner.php /path/to/your/opencart/
+   cp -r system/* <oc_root>/system/
+   cp test_runner.php <oc_root>/
    ```
    
    Or on Windows:
    
    ```cmd
-   xcopy /E /Y falael-cache\system\* C:\path\to\your\opencart\system\
-   copy /Y falael-cache\test_runner.php C:\path\to\your\opencart\
+   xcopy /E /Y system\* <oc_root>\system\
+   copy /Y <oc_root>\test_runner.php <oc_root>\
    ```
 
 3. **Clear existing cache (optional but recommended):**
 
    ```bash
-   rm -rf system/storage/cache/*
+   rm -rf <oc_root>/system/storage/cache/*
    ```
    
    Or on Windows:
    
    ```cmd
-   del /Q /S system\storage\cache\*
+   del /Q /S <oc_root>\system\storage\cache\*
    ```
 
 No configuration changes or additional dependencies required. The driver is fully compatible with OpenCart's existing cache interface.

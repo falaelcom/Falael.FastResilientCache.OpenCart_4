@@ -1,130 +1,134 @@
 <?php
-namespace Opencart\System\Library\Cache;
+namespace Cache;
 
 /**
- * Class File - Falael Fast Resilient File Cache v1.0b
+ * Class File - Falael Fast Resilient File Cache v1.0b (Adapted to OC 3.x, PHP 7.*)
  *
- * @package Opencart\System\Library\Cache
+ * Provides a high-concurrency, resilient file-based cache for OpenCart.
+ * Implements L1/L2 Swap logic, Delete-Over-Write priority, and 
+ * time-gated atomic Garbage Collection.
+ *
+ * @package Cache
  */
 class File {
     /**
      * @var int Default cache expiry in seconds
      */
-    private int $expire;
+    private $expire;
     
     /**
      * @var string Cache directory
      */
-    private string $cache_dir;
+    private $cache_dir;
     
     /**
      * @var BucketLock Lock manager
      */
-    private BucketLock $lock;
+    private $lock;
     
     /**
      * @var string|null Test mode flag
      */
-    private ?string $test_mode = null;
+    private $test_mode = null;
 
     /**
      * @var bool Debug flag for diagnostic logging
      */
-    private const DEBUG_MODE = false;
+    const DEBUG_MODE = false;
 
     // --- GC CONFIGURATION PROPERTIES (Initialized from constants, overridable for tests) ---
 
     /**
      * @var int Minimum seconds between GC runs
      */
-    private int $gc_interval;
+    private $gc_interval;
 
     /**
      * @var int Start hour for GC (0 = Midnight)
      */
-    private int $gc_start_hour;
+    private $gc_start_hour;
 
     /**
      * @var int End hour for GC (6 = 6 AM)
      */
-    private int $gc_end_hour;
+    private $gc_end_hour;
     
     // --- CONSTANTS ---
 
     /**
      * Name of write lock file
      */
-    private const LOCK_FILE_WRITE = 'lock-write';
+    const LOCK_FILE_WRITE = 'lock-write';
     
     /**
      * Name of delete lock file
      */
-    private const LOCK_FILE_DELETE = 'lock-delete';
+    const LOCK_FILE_DELETE = 'lock-delete';
     
     /**
      * Name of rebuild cache value lock file
      */
-    private const LOCK_FILE_REBUILD = 'lock-rebuild';
+    const LOCK_FILE_REBUILD = 'lock-rebuild';
 
     /**
      * File to store the last GC run timestamp (cache-global)
      */
-    private const GC_CONTROL_FILE = 'gc-control';
+    const GC_CONTROL_FILE = 'gc-control';
 
     /**
      * Default Minimum seconds between GC runs (12 hours)
      */
-    private const DEFAULT_GC_INTERVAL = 43200; 
+    const DEFAULT_GC_INTERVAL = 43200; 
 
     /**
      * Default Start hour for GC (0 = Midnight)
      */
-    private const DEFAULT_GC_START_HOUR = 0;
+    const DEFAULT_GC_START_HOUR = 0;
 
     /**
      * Default End hour for GC (6 = 6 AM)
      */
-    private const DEFAULT_GC_END_HOUR = 6;
+    const DEFAULT_GC_END_HOUR = 6;
     
     /**
      * When expire equals this value, skip TTL expiration entirely
      */
-    private const NO_EXPIRATION_THRESHOLD_SECONDS = 3601;
+    const NO_EXPIRATION_THRESHOLD_SECONDS = 3601;
     
     /**
      * Grace delay before rebuild operation (microseconds) - imposes a max rebuild rate per bucket (rebuild lock always holds for only this value while still allowing for mutliple rebuilds; opencart cache interface doesn't allow for holding rebuild lock during rebuild)
      */
-    private const GET_GRACE_DELAY_US = 20000;
+    const GET_GRACE_DELAY_US = 20000;
 
     /**
      * Timeout for acquiring rebuild lock (ms)
      */
-    private const REBUILD_LOCK_TIMEOUT_MS = 10;
+    const REBUILD_LOCK_TIMEOUT_MS = 10;
     
     /**
      * Timeout for acquiring write lock (ms)
      */
-    private const WRITE_LOCK_TIMEOUT_MS = 100;
+    const WRITE_LOCK_TIMEOUT_MS = 100;
     
     /**
      * Timeout for acquiring delete lock (ms)
      */
-    private const DELETE_LOCK_TIMEOUT_MS = 60000;
+    const DELETE_LOCK_TIMEOUT_MS = 60000;
     
     /**
      * Max stale files before cleanup in set()
      */
-    private const MAX_STALE_FILES = 1;
+    const MAX_STALE_FILES = 1;
     
     /**
      * L1 filename prefix
      */
-    private const L1_PREFIX = 'l1-';
+    const L1_PREFIX = 'l1-';
 
     /**
      * Threshold of files in a bucket before enabling empty directory pruning
      */
-    private const DIR_PRUNE_THRESHOLD = 15000;
+    const DIR_PRUNE_THRESHOLD = 15000;
 
     /**
      * Constructor
@@ -132,8 +136,8 @@ class File {
      * @param int $expire Default expiry time in seconds
      * @param string|null $test_mode Optional test mode flag
      */
-    public function __construct(int $expire = 3600, string $test_mode = null) {
-        $this->expire = $expire;
+    public function __construct($expire = 3600, $test_mode = null) {
+        $this->expire = (int)$expire;
         $this->cache_dir = rtrim(DIR_CACHE, '/') . '/';
         $this->lock = new BucketLock($this->cache_dir, self::LOCK_FILE_WRITE, self::LOCK_FILE_DELETE, self::LOCK_FILE_REBUILD);
         $this->test_mode = $test_mode;
@@ -156,11 +160,11 @@ class File {
     /**
      * DIAGNOSTIC LOGGING
      */
-    private function log(string $msg): void {
+    private function log($msg) {
         if (!self::DEBUG_MODE) {
             return;
         }
-        $path = defined('DIR_LOGS') ? DIR_LOGS . 'cache_debug.log' : __DIR__ . '/cache_debug.log';
+        $path = defined('DIR_LOGS') ? DIR_LOGS . 'cache_debug.log' : $this->cache_dir . 'cache_debug.log';
         @file_put_contents($path, date('H:i:s.') . sprintf('%03d', (int)(microtime(true) * 1000) % 1000) . " [" . getmypid() . "] | " . $msg . "\n", FILE_APPEND);
     }
     
@@ -170,7 +174,7 @@ class File {
      * @param string $key Cache key like "product.123"
      * @return string Bucket name like "product"
      */
-    private function getBucket(string $key): string {
+    private function getBucket($key) {
         $safe_key = preg_replace('/[^A-Z0-9\._-]/i', '', $key);
         $segments = explode('.', $safe_key);
         return $segments[0];
@@ -182,7 +186,7 @@ class File {
      * @param string $key Cache key
      * @return string Full path to data directory
      */
-    private function getDataDir(string $key): string {
+    private function getDataDir($key) {
         $safe_key = preg_replace('/[^A-Z0-9\._-]/i', '', $key);
         $segments = explode('.', $safe_key);
         return $this->cache_dir . implode('/', $segments) . '/';
@@ -192,9 +196,9 @@ class File {
      * Get cached value
      *
      * @param string $key Cache key
-     * @return mixed Cached value or empty array if not found
+     * @return mixed Cached value or null if not found
      */
-    public function get(string $key): mixed {
+    public function get($key) {
         $this->log("GET [" . $key . "]");
         try {
             $dir = $this->getDataDir($key);
@@ -220,7 +224,7 @@ class File {
                 $this->lock->releaseRebuild();
                 $this->log("  -> Released Rebuild Lock");
                 // Return empty - caller will rebuild and call set()
-                return null;
+                return null;	//	return null instead of false
             }
             
             // No lock - enormous get load (multiple get requests on the same bukcet within 20ms) or delete op is in progress
@@ -236,7 +240,7 @@ class File {
             // No L1 - must rebuild
             $this->log("  -> MISS (no L1 either)");
             return null;
-        } catch (\Throwable $e) {
+        } catch (\Exception $e) {
             $this->log("ERROR GET: " . $e->getMessage());
             error_log("CACHE ERROR [get]: " . $e->getMessage());
             return null;
@@ -249,7 +253,7 @@ class File {
      * @param string $dir Data directory
      * @return mixed Data or null if not found/error
      */
-    private function readL2(string $dir): mixed {
+    private function readL2($dir) {
         if (!is_dir($dir)) {
             return null;
         }
@@ -296,7 +300,7 @@ class File {
      * @param string $dir Data directory
      * @return mixed Data or null if not found/error
      */
-    private function readL1(string $dir): mixed {
+    private function readL1($dir) {
         if (!is_dir($dir)) {
             return null;
         }
@@ -333,11 +337,11 @@ class File {
      * @param mixed $value Value to cache
      * @param int $expire Expiry time in seconds (0 = use default)
      */
-    public function set(string $key, mixed $value, int $expire = 0): void {
+    public function set($key, $value, $expire = 0) {
         $this->log("SET [" . $key . "]");
         try {
             $this->_set($key, $value, $expire);
-        } catch (\Throwable $e) {
+        } catch (\Exception $e) {
             $this->log("ERROR SET: " . $e->getMessage());
             error_log("CACHE ERROR [set]: " . $e->getMessage());
         }
@@ -350,7 +354,7 @@ class File {
      * @param mixed $value Value to cache
      * @param int $expire Expiry time in seconds (0 = use default)
      */
-    private function _set(string $key, mixed $value, int $expire = 0): void {
+    private function _set($key, $value, $expire = 0) {
         $bucket = $this->getBucket($key);
         
         // 1. Capture Invalidation Token (Baseline) - MUST BE FIRST
@@ -449,7 +453,7 @@ class File {
         }
     }
 
-    private function rmrfRecursive(string $dir): void {
+    private function rmrfRecursive($dir) {
 		$dir = rtrim($dir, '/') . '/';
 		$items = @scandir($dir);
 		if (!$items) {
@@ -475,7 +479,7 @@ class File {
      *
      * @param string $key Cache key
      */
-	public function delete(string $key): void {
+	public function delete($key) {
 		if (strpos($key, '__PURGE__') === 0) {
 			$clean_key = substr($key, 9);
 			$this->purge($clean_key);
@@ -567,11 +571,12 @@ class File {
 					$this->log("  -> Delete lock released");
 				}
 			}
-		} catch (\Throwable $e) {
+		} catch (\Exception $e) {
 			$this->log("ERROR DELETE: " . $e->getMessage());
 			error_log("CACHE ERROR [delete]: " . $e->getMessage());
 		}
 	}    
+
     /**
      * Recursively process subdirectories and files
      * Implements L2->L1 Swap logic and preserves directory structure
@@ -579,7 +584,7 @@ class File {
      *
      * @param string $dir Directory to clean
      */
-    private function deleteRecursive(string $dir): void {
+    private function deleteRecursive($dir) {
         $items = @scandir($dir);
         if (!$items) {
             return;
@@ -644,7 +649,7 @@ class File {
         }
     }
 
-	public function purge(string $key): void {
+	public function purge($key) {
 		$this->log("PURGE CALLED [" . $key . "]");
 		try {
 			// Handle Wildcard (Global Wipe)
@@ -745,7 +750,7 @@ class File {
 					$this->log("  -> Delete lock released for purge");
 				}
 			}
-		} catch (\Throwable $e) {
+		} catch (\Exception $e) {
 			$this->log("ERROR PURGE: " . $e->getMessage());
 			error_log("CACHE ERROR [purge]: " . $e->getMessage());
 		}
@@ -754,7 +759,7 @@ class File {
 	/**
 	 * Recursively purge subdirectories (total destruction)
 	 */
-	private function purgeRecursive(string $dir): void {
+	private function purgeRecursive($dir) {
 		$items = @scandir($dir);
 		if (!$items) return;
 		
@@ -836,7 +841,7 @@ class File {
                 flock($handle, LOCK_UN);
                 fclose($handle);
             }
-        } catch (\Throwable $e) {
+        } catch (\Exception $e) {
             error_log("CACHE ERROR [gc]: " . $e->getMessage());
         }
     }
@@ -846,7 +851,7 @@ class File {
      *
      * @param string $dir Root cache directory
      */
-    private function cleanupExpired(string $dir): void {
+    private function cleanupExpired($dir) {
         $items = @scandir($dir);
         if (!$items) {
             return;
@@ -898,7 +903,7 @@ class File {
      * @param string $dir Directory to clean
      * @param bool $prune_empty Whether to remove empty directories
      */
-    private function cleanupExpiredRecursive(string $dir, bool $prune_empty = false): void {
+    private function cleanupExpiredRecursive($dir, $prune_empty = false) {
         $items = @scandir($dir);
         if (!$items) {
              if ($prune_empty) @rmdir($dir);
@@ -986,22 +991,22 @@ class BucketLock {
     /**
      * @var string Base directory for cache
      */
-    private string $cache_dir;
+    private $cache_dir;
     
     /**
      * @var string File name of the lock file for write op sync, per bucket
      */
-    private string $lock_file_write;
+    private $lock_file_write;
 
     /**
      * @var string File name of the lock file for delete op priority sync, per bucket
      */
-    private string $lock_file_delete;
+    private $lock_file_delete;
 
     /**
      * @var string File name of the lock file for cache value rebuild op sync, per key
      */
-    private string $lock_file_rebuild;
+    private $lock_file_rebuild;
     
     /**
      * @var resource|null Current write lock handle
@@ -1021,19 +1026,19 @@ class BucketLock {
     /**
      * Retry interval in milliseconds
      */
-    private const RETRY_MS = 5;
+    const RETRY_MS = 5;
 
     /**
      * @var bool Debug flag for diagnostic logging
      */
-    private const DEBUG_MODE = false;
+    const DEBUG_MODE = false;
     
     /**
      * Constructor
      *
      * @param string $cache_dir Base directory for cache
      */
-    public function __construct(string $cache_dir, string $lock_file_write, string $lock_file_delete, string $lock_file_rebuild) {
+    public function __construct($cache_dir, $lock_file_write, $lock_file_delete, $lock_file_rebuild) {
         $this->cache_dir = $cache_dir;
         $this->lock_file_write = $lock_file_write;
         $this->lock_file_delete = $lock_file_delete;
@@ -1043,7 +1048,7 @@ class BucketLock {
     /**
      * DIAGNOSTIC LOGGING
      */
-    private function log(string $msg): void {
+    private function log($msg) {
         if (!self::DEBUG_MODE) {
             return;
         }
@@ -1054,28 +1059,28 @@ class BucketLock {
     /**
      * Get write lock file path for bucket
      */
-    private function getWriteLockPath(string $bucket): string {
+    private function getWriteLockPath($bucket) {
         return $this->cache_dir . $bucket . '/' . $this->lock_file_write;
     }
     
     /**
      * Get delete lock file path for bucket
      */
-    private function getDeleteLockPath(string $bucket): string {
+    private function getDeleteLockPath($bucket) {
         return $this->cache_dir . $bucket . '/' . $this->lock_file_delete;
     }
     
     /**
      * Get rebuild lock file path for bucket
      */
-    private function getRebuildLockPath(string $bucket): string {
+    private function getRebuildLockPath($bucket) {
         return $this->cache_dir . $bucket . '/' . $this->lock_file_rebuild;
     }
     
     /**
      * Ensure bucket directory exists
      */
-    private function ensureBucketExists(string $bucket): bool {
+    private function ensureBucketExists($bucket) {
         $dir = $this->cache_dir . $bucket . '/';
         
         if (!is_dir($dir)) {
@@ -1092,7 +1097,7 @@ class BucketLock {
      * Get the Invalidation Token (Modification time of the delete lock file)
      * Used to detect if a delete operation occurred between two points in time.
      */
-    public function getInvalidationToken(string $bucket): int {
+    public function getInvalidationToken($bucket) {
         if (!is_dir($this->cache_dir . $bucket)) return 0;
         
         $path = $this->getDeleteLockPath($bucket);
@@ -1108,7 +1113,7 @@ class BucketLock {
      * Mark Invalidation (Update Token)
      * Updates the mtime of the delete lock file.
      */
-    public function markInvalidation(string $bucket): void {
+    public function markInvalidation($bucket) {
         if (!$this->ensureBucketExists($bucket)) return;
         $path = $this->getDeleteLockPath($bucket);
         @touch($path);
@@ -1122,7 +1127,7 @@ class BucketLock {
      * @param string $bucket
      * @return bool True if NO delete is active (safe to write), False if delete is active
      */
-    public function checkDelete(string $bucket): bool {
+    public function checkDelete($bucket) {
         // If bucket dir doesn't exist, no delete can be active
         if (!is_dir($this->cache_dir . $bucket)) {
             return true;
@@ -1148,7 +1153,7 @@ class BucketLock {
         try {
             // We use 'r' to ensure we never create the file or modify mtime
             $handle = fopen($path, 'r');
-        } catch (\Throwable $e) {
+        } catch (\Exception $e) {
             // Catch any unexpected fatal errors
         } finally {
             // Always restore the original handler immediately
@@ -1180,11 +1185,10 @@ class BucketLock {
      * @param int $timeout_ms
      * @return bool
      */
-    public function acquireDelete(string $bucket, int $timeout_ms): bool {
+    public function acquireDelete($bucket, $timeout_ms) {
         if (!$this->ensureBucketExists($bucket)) {
             return false;
         }
-
         $path = $this->getDeleteLockPath($bucket);
         $start = microtime(true) * 1000;
         $attempt = 0;
@@ -1213,7 +1217,7 @@ class BucketLock {
     /**
      * Release delete lock
      */
-    public function releaseDelete(): void {
+    public function releaseDelete() {
         if ($this->delete_handle) {
             flock($this->delete_handle, LOCK_UN);
             fclose($this->delete_handle);
@@ -1229,7 +1233,7 @@ class BucketLock {
      * @param int $timeout_ms Timeout in milliseconds
      * @return bool True if acquired
      */
-    public function acquireWrite(string $bucket, int $timeout_ms): bool {
+    public function acquireWrite($bucket, $timeout_ms) {
         if (!$this->ensureBucketExists($bucket)) {
             return false;
         }
@@ -1261,7 +1265,7 @@ class BucketLock {
     /**
      * Release write lock
      */
-    public function releaseWrite(): void {
+    public function releaseWrite() {
         if ($this->write_handle) {
             flock($this->write_handle, LOCK_UN);
             fclose($this->write_handle);
@@ -1277,7 +1281,7 @@ class BucketLock {
      * @param int $timeout_ms Timeout in milliseconds
      * @return bool True if acquired
      */
-    public function acquireRebuild(string $bucket, int $timeout_ms): bool {
+    public function acquireRebuild($bucket, $timeout_ms) {
         if (!$this->ensureBucketExists($bucket)) {
             return false;
         }
@@ -1309,7 +1313,7 @@ class BucketLock {
     /**
      * Release rebuild lock
      */
-    public function releaseRebuild(): void {
+    public function releaseRebuild() {
         if ($this->rebuild_handle) {
             flock($this->rebuild_handle, LOCK_UN);
             fclose($this->rebuild_handle);
