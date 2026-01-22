@@ -93,7 +93,7 @@ Tested in production: Currently active on a live production web store (400-1200 
 
 - **Cache Miss vs Cached Empty Array Detection Bugfix**  
   - Challenge: OpenCart's cache interface doesn't distinguish cached empty arrays (`get()` returns `[]`) from cache miss (`get()` also returns `[]`).  
-  - Solution: Returns explicit NULL on cache miss instead of empty array; backwards compatible with existing `if(!$cached_data)` checks in OpenCart core and plugins while enabling precise `if($cached_data === null)` cache miss detection for codebases that adopt the fix.
+  - Solution: Returns explicit NULL on cache miss instead of empty array (or `false` with OpenCart 3.x); backwards compatible with existing `if(!$cached_data)` checks in OpenCart core and plugins while enabling precise `if($cached_data === null)` cache miss detection for codebases that adopt the fix.
   
 - **Non-Blocking Optimistic Gatekeeper Checks**
   - Challenge: Lock acquisition attempts block even when operation will inevitably fail.
