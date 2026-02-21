@@ -18,7 +18,7 @@ OpenCart's stock file cache engine utilizes `glob()` for file lookups, which lea
 
 ### Abstract
 
-The Falael Fast Resilient File Cache is a specialized drop-in replacement for the default OpenCart 4.x family of file cache drivers. It replaces the stock O(N) `glob()`-based lookups with an O(1) deterministic structured path model and reduces the happy `get` scenario operations (return of a valid cache value) to the absolute minimum, achieving an average 4x increase in OpenCart overall page serving speed. Built for high-concurrency environments, it eliminates common issues like race conditions, deadlocks, and data corruption through a combination of advisory rebuild locks and invalidation tokens. The driver remains fully compatible with the standard transactionless OpenCart interface while providing fault-tolerant behavior even during unsynchronized external filesystem wipes (`rm -rf cache/*`).
+The Falael Fast Resilient File Cache is a specialized drop-in replacement for the default OpenCart 4.x family of file cache drivers. It replaces the stock O(N) `glob()`-based lookups with an O(1) deterministic structured path model and reduces the happy `get` scenario FS-operations (return of a valid cache value) to the absolute minimum, achieving an average 4x increase in OpenCart overall page serving speed. Built for high-concurrency environments, it eliminates common issues like race conditions, deadlocks, and data corruption through a combination of advisory rebuild locks and invalidation tokens. The driver remains fully compatible with the standard transactionless OpenCart interface while providing fault-tolerant behavior even during unsynchronized external filesystem wipes (`rm -rf cache/*`).
 
 Under rebuild or invalidation storms, the driver prioritizes availability of the most recent known truth over request timeout by serving stale L1 data while L2 is being rebuilt; once any rebuild completes, L2 immediately becomes the new source of truth for all subsequent requests, preventing timeout cascades that would occur if all concurrent readers simultaneously hammered the database and rendering layer while also triggering chaotic parallel GC operations that could delete freshly-rebuilt cache files before they're read, causing further rebuild cascades.
 
@@ -53,7 +53,7 @@ Tested in production: Currently active on a live production web store (400-1200 
 
 - **Two-Tier Caching Strategy (L2/L1)**  
   - Challenge: Cache invalidation typically forces all readers to wait for rebuild, causing latency spikes.  
-  - Solution: Fresh timestamped files (L2) with stale backup copies (L1) enable fast `get` reads during invalidate/dropped rebuild operations.
+  - Solution: Fresh timestamped files (L2) with stale backup copies (L1) enable fast `get` reads during invalidate/rebuild operations.
 
 - **Delete-Over-Write Priority Locking**  
   - Challenge: Concurrent writes during invalidation can corrupt cache state or resurrect stale data to L2.  
@@ -69,7 +69,7 @@ Tested in production: Currently active on a live production web store (400-1200 
 
 - **L2 -> L1 Swap on Delete (Graceful Degradation)**  
   - Challenge: Cache invalidation destroys data, forcing all readers to block on rebuild, also during cache invalidation.
-  - Solution: Invalidation promotes newest L2 to L1 instead of destruction; maintains stale data availability during rebuild/invalidation storms by serving L1 stale data during invalidation and `get`-s dropped due to rebuild rate limiting.
+  - Solution: Invalidation promotes newest L2 to L1 instead of destruction; maintains stale data availability during rebuild/invalidation storms by serving L1 stale data during invalidation and `get` revuilds dropped due to rebuild rate limiting.
 
 - **Zombie Promotion Garbage Collection**  
   - Challenge: Aggressive GC deletion causes cache misses and rebuild storms under high load.  
@@ -85,11 +85,11 @@ Tested in production: Currently active on a live production web store (400-1200 
 
 - **Per-Bucket Lock Granularity**  
   - Challenge: Hierarchical key/directory locking (matching OpenCart's nested key structure) is prohibitively I/O-expensive; global locks serialize all operations. 
-  - Solution: Locks scoped to first key segment (bucket) (e.g., `product.*`, `category.*`) serialize only write/delete operations per bucket; the most common-case L2 hit path remains completely lock-free, while cache-miss rebuilds use rate-limited NULL returns with L1 fallback instead of blocking, eliminating hierarchical locking overhead and complexity while preventing cross-bucket contention. 
+  - Solution: Locks scoped to first key segment (bucket) (e.g., `product.*`, `category.*`) serialize only write/delete operations per bucket; the most common-case L2 hit path remains completely lock-free, while cache-miss rebuilds use rate-limited NULL returns causing rebuilds with L1 fallback instead of blocking, eliminating hierarchical locking overhead and complexity while preventing cross-bucket contention. 
   
 - **Time-Gated Atomic Garbage Collection with Configurable Windows**  
   - Challenge: Frequent GC runs cause I/O spikes, especially when using probabilistic approach (1 of 100 requests have the chance to cause GC) - in high load scenarios request quantity per minute increases, effectively increasing the absolute density of GCs in a unit of time, also leading to concurrent GC runs; concurrent GC processes might corrupt cache state and cause a cascade of failing `unlink`-s. 
-  - Solution: `flock()`-controlled single-process GC with configurable interval and time-of-day restrictions.
+  - Solution: `flock()`-controlled single-process GC with configurable interval and time-of-day restrictions prevents GC from running during well-known time windows of high web site load.
 
 - **Cache Miss vs Cached Empty Array Detection Bugfix**  
   - Challenge: OpenCart's cache interface doesn't distinguish cached empty arrays (`get()` returns `[]`) from cache miss (`get()` also returns `[]`).  
@@ -167,6 +167,7 @@ if (!$data) {
     $data = $this->model_catalog_product->getProduct($product_id);
     $this->cache->set('product.' . $product_id, $data);
 }
+
 ```
 
 **Optimized pattern (precise cache miss detection):**
@@ -177,82 +178,176 @@ if ($data === null) {
     $data = $this->model_catalog_product->getProduct($product_id);
     $this->cache->set('product.' . $product_id, $data);
 }
+
 ```
 
 This allows caching of empty arrays, false values, and other falsy data without triggering unnecessary rebuilds.
+
 
 #### 2. Implement Product-Level Cache Invalidation
 
 **Background:**
 
-OpenCart's default `product` bucket stores all product-related cache (category lists, bestsellers, related products) but not individual product pages. Caching product page data significantly improves site responsiveness during episoeds of high contention. By default any admin product change invalidates the entire 'product' bucket, causing unnecessary cache misses across the store.
+Stock OpenCart's `product` bucket holds only id-agnostic list queries — `getProducts()`, `getSpecials()`, and similar filtered collection queries. Individual product records and related product lists are not cached at all; every product page load and every related products section is a live database query. This optimization introduces a dedicated `product_by_id` bucket for per-product caching. The `product` bucket is left unchanged and continues to be bulk-invalidated on any product change — which remains acceptable since it now exclusively holds lightweight list queries. The new invalidation wiring ensures `product_by_id` entries are kept consistent with the database.
 
 **Solution: Separate Bucket for Product Detail Pages**
 
-Create a dedicated `product_by_id` bucket for individual product page caching with granular invalidation.
+Move all per-product data into a dedicated `product_by_id` bucket with granular per-product-id invalidation. The `product` bucket then exclusively holds id-agnostic list queries and becomes lightweight — a product edit or order placement no longer triggers a full list rebuild across the store.
 
-**Step 1: Implement Product Page Caching**
+**Cache Individual Product Records at the Model Level**
 
-Locate your product detail page controller (typically `catalog/controller/product/product.php`) and wrap the rendering logic:
+Stock OpenCart's `getProduct()` makes a live database query on every call — there is no caching of individual product records. On a busy store every product page load hits the database directly.
+
+Add cache get/set around the query in `catalog/model/catalog/product.php`:
 
 ```php
-// Example location: catalog/controller/product/product.php
-public function index(): void {
-    $product_id = (int)$this->request->get['product_id'];
-    
-    // Attempt cache read
-    $data = $this->cache->get('product_by_id.' . $product_id);
-    
-    if ($data === null) {
-        // Cache miss - rebuild page data
-        $data = $this->buildProductData($product_id); // Your existing rendering logic
-        
-        // Cache the result
-        $this->cache->set('product_by_id.' . $product_id, $data);
+public function getProduct(int $product_id): array {
+    $sql = "SELECT DISTINCT *, `pd`.`name`, `p`.`image`, ...
+            WHERE `p2s`.`product_id` = '" . (int)$product_id . "'
+            AND `p2s`.`store_id` = '" . (int)$this->config->get('config_store_id') . "'
+            AND `pd`.`language_id` = '" . (int)$this->config->get('config_language_id') . "'";
+
+    $key = 'product_by_id.' . (int)$product_id . '.' . md5($sql);
+
+    $product_data = $this->cache->get($key);
+
+    if ($product_data !== null) {
+        return $product_data;
     }
-    
-    // Render using cached data
-    $this->response->setOutput($this->load->view('product/product', $data));
+
+    $query = $this->db->query($sql);
+
+    if ($query->num_rows) {
+        $product_data = $query->row;
+        // ... post-process fields ...
+        $this->cache->set($key, $product_data);
+        return $product_data;
+    }
+
+    return [];
 }
+
 ```
 
-**Step 2: Add Granular Invalidation in Admin**
+The key is `product_by_id.{id}.{md5(sql)}` rather than just `product_by_id.{id}` because the SQL embeds `store_id` and `language_id` — a single product has a distinct record per store/language combination. The md5 makes the key automatically unique across all of them without any additional logic.
 
-Modify `admin/model/catalog/product.php`:
+`!== null` is used for the cache miss check rather than `!$data` — as covered in section 1.
+
+**Cache Related Product Lists (`getRelated`) with Bi-Directional Invalidation**
+
+Stock OpenCart's `getRelated()` also makes a live database query on every call. Add cache get/set in `catalog/model/catalog/product.php`:
 
 ```php
-// In editProduct() method (after product update)
-$this->cache->delete('product_by_id.' . (int)$product_id); // Single product page only
-$this->cache->delete('product');                            // Product lists (categories, bestsellers, etc.)
+public function getRelated(int $product_id): array {
+    $sql = "SELECT DISTINCT *, `pd`.`name` AS `name`, `p`.`image`, ...
+            FROM `" . DB_PREFIX . "product_related` `pr`
+            ...
+            WHERE `pr`.`product_id` = '" . (int)$product_id . "'
+            AND `pd`.`language_id` = '" . (int)$this->config->get('config_language_id') . "'";
+
+    $key = 'product_by_id.' . (int)$product_id . '.related.' . md5($sql);
+
+    $product_data = $this->cache->get($key);
+
+    if ($product_data === null) {
+        $query = $this->db->query($sql);
+        $product_data = $query->rows;
+        $this->cache->set($key, $product_data);
+    }
+
+    foreach ($product_data as &$product) {
+        $product['price'] = (float)($product['discount'] ?: $product['price']);
+    }
+
+    return (array)$product_data;
+}
+
 ```
 
+**The bi-directional invalidation problem:**
+
+The related list for product A is cached at `product_by_id.A.related.{hash}` and contains a snapshot of each related product's name, price, and image. If related product B is later edited — price change, name change, disabled — A's cached related list is now stale, even though A itself was not touched.
+
+This means when product B is edited, two things need to be invalidated:
+
+1. B's own cache subtree — its record and its own related list
+2. The related list cache of every other product that lists B
+
+The cache key structure makes this surgical. Dot segments map to directory depth:
+
+- `product_by_id.A.{hash}` → `cache/product_by_id/A/{hash}` (A's product record)
+- `product_by_id.A.related.{hash}` → `cache/product_by_id/A/related/{hash}` (A's related list)
+
+`delete('product_by_id.B')` wipes the entire `product_by_id/B/` subtree — B's record and B's own related list — in one shot.
+
+`delete('product_by_id.A.related')` wipes only `product_by_id/A/related/` — A's related list — leaving A's product record cache untouched, since it didn't change.
+
+**Wiring up the invalidation in admin:**
+
+In `admin/model/catalog/product.php`, before modifying the product, query which other products list it in their related section, then use that list after the edit is complete:
+
 ```php
-// In deleteProduct() method
-$this->cache->delete('__PURGE__product_by_id.' . (int)$product_id);	//	the `'__PURGE__'` prefix forces `$this->cache->delete` to delete both L1 and L2 cache entries while still preserving directories
+// editProduct() — fetch reverse relationships BEFORE any modifications
+$reverse_query = $this->db->query(
+    "SELECT `product_id` FROM `" . DB_PREFIX . "product_related`
+     WHERE `related_id` = '" . (int)$product_id . "'"
+);
+$reverse_products = array_column($reverse_query->rows, 'product_id');
+
+// ... proceed with edit ...
+
+// Invalidate the related-list cache of every product that lists this one
+foreach ($reverse_products as $reverse_id) {
+    $this->cache->delete('product_by_id.' . $reverse_id . '.related');
+}
+// Wipe this product's full cache subtree (record + its own related list)
+$this->cache->delete('product_by_id.' . (int)$product_id);
+// Wipe id-agnostic list queries
 $this->cache->delete('product');
+
 ```
 
-**Step 3: Add Stock-Based Invalidation in Checkout**
+```php
+// deleteProduct() — same reverse lookup, but hard-purge this product's subtree
+foreach ($reverse_products as $reverse_id) {
+    $this->cache->delete('product_by_id.' . $reverse_id . '.related');
+}
+// __PURGE__ triggers recursive deletion with directory cleanup rather than L2→L1 demotion
+$this->cache->delete('__PURGE__product_by_id.' . (int)$product_id);
+$this->cache->delete('product');
+
+```
+
+The reverse lookup is fetched before `deleteRelated()` runs because `deleteRelated` removes B's forward relationship rows. The reverse query (`WHERE related_id = B`) is unaffected by that, but pre-fetching ensures a consistent snapshot before any modifications begin.
+
+
+**Stock-Based Invalidation in Checkout**
 
 Modify `catalog/model/checkout/order.php` in the `addHistory()` method (after stock updates):
 
 ```php
-// Around line ~500, after stock subtraction/addition
+// Invalidate only the ordered products, not the entire product bucket
+// Note: not thoroughly tested — monitor for edge cases in high-volume scenarios
 foreach ($order_products as $order_product) {
     $this->cache->delete('product_by_id.' . (int)$order_product['product_id']);
 }
-$this->cache->delete('product'); // Lists may show stock status indicators
+// Invalidate id-agnostic product lists (bestsellers, stock status indicators, etc.)
+$this->cache->delete('product');
+
 ```
 
 **Impact:**
 
-- Product page edits: Only invalidate 1 key instead of all products
-- Order placement: Only invalidate affected product pages (typically 1-5 keys) instead of all products
+- **Product edit:** Invalidates 1 product's cache subtree + N reverse related-list keys instead of the entire product bucket
+- **Product delete:** Hard-purges 1 product's cache subtree + N reverse related-list keys instead of the entire product bucket
+- **Order placement:** Invalidates only the 1–5 ordered product records instead of the entire product bucket
+- **`product` bucket** is unaffected by per-product operations — cold-cache list rebuilds become rare rather than triggered on every product interaction
 
-**Files To Modify:**
-- `catalog/controller/product/product.php` (or equivalent product detail controller)
-- `admin/model/catalog/product.php`
-- `catalog/model/checkout/order.php`
+**Files to Modify:**
+
+- `catalog/model/catalog/product.php` — `getProduct()` and `getRelated()` cache key scoping
+- `admin/model/catalog/product.php` — `addProduct()`, `editProduct()`, `deleteProduct()` invalidation
+- `catalog/model/checkout/order.php` — order placement invalidation
 
 ## Tests
 
